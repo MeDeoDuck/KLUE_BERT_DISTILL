@@ -1,0 +1,7 @@
+local_classifier/artifacts/
+__pycache__/
+*.pyc
+.venv/
+.env
+.idea/
+.vscode/
