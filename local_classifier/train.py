@@ -8,9 +8,12 @@ Env:  TRANSFORMERS_NO_ADVISORY_WARNINGS=1 helps quiet output.
 from __future__ import annotations
 
 import json
+import os
+import random
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -19,10 +22,35 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
+    set_seed as hf_set_seed,
 )
 
 from local_classifier import config as C
 from local_classifier.dataset import CommentDataset
+
+
+def set_all_seeds(seed: int) -> None:
+    """Pin every RNG that affects training so runs are comparable.
+
+    Note: full bit-exact determinism on CUDA needs cudnn.deterministic=True and
+    benchmark=False, which we set here. Slight throughput cost is acceptable
+    given our short runs (~10 min).
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    hf_set_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _worker_init(worker_id: int) -> None:
+    # Make each DataLoader worker have its own deterministic seed.
+    seed = (torch.initial_seed() + worker_id) % (2 ** 31)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def load_class_weights(device: torch.device) -> torch.Tensor | None:
@@ -77,16 +105,19 @@ def evaluate(model, loader, device, class_w):
 
 
 def main() -> None:
+    set_all_seeds(C.SEED)
+    print(f"seed={C.SEED}  (deterministic mode)")
+
     if not torch.cuda.is_available():
         print("[warn] CUDA not available — training on CPU will be very slow.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}  cuda={torch.cuda.is_available()} "
           f"name={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}")
 
-    # A40 / Ampere — enable TF32 matmul (free speedup, fp32 path)
+    # A40 / Ampere — TF32 matmul (deterministic-compatible).
+    # cudnn.benchmark stays OFF (set by set_all_seeds) for reproducibility.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
 
     tokenizer = AutoTokenizer.from_pretrained(C.BASE_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -99,6 +130,9 @@ def main() -> None:
     train_ds = CommentDataset(C.DATA_DIR / "train.jsonl", tokenizer, C.MAX_SEQ_LEN)
     val_ds = CommentDataset(C.DATA_DIR / "val.jsonl", tokenizer, C.MAX_SEQ_LEN)
 
+    train_gen = torch.Generator()
+    train_gen.manual_seed(C.SEED)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=C.TRAIN_BATCH_SIZE,
@@ -106,6 +140,8 @@ def main() -> None:
         num_workers=C.DATALOADER_NUM_WORKERS,
         pin_memory=C.PIN_MEMORY and device.type == "cuda",
         drop_last=False,
+        generator=train_gen,
+        worker_init_fn=_worker_init if C.DATALOADER_NUM_WORKERS > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
