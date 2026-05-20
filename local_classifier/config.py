@@ -48,13 +48,13 @@ TEST_RATIO = 0.10
 SEED = 42
 
 # ---- Model -----------------------------------------------------------------
-BASE_MODEL = "klue/roberta-base"        # swap to klue/roberta-large on A40 if needed
+BASE_MODEL = "klue/roberta-large"       # 340M; swap back to roberta-base to compare
 MAX_SEQ_LEN = 128
 
 # ---- Training (A40 48GB) ---------------------------------------------------
-TRAIN_BATCH_SIZE = 64                   # base@128 seq fits comfortably; bump to 128 for large
-EVAL_BATCH_SIZE = 128
-LEARNING_RATE = 2e-5
+TRAIN_BATCH_SIZE = 32                   # large@128 seq — safe on A40, no OOM
+EVAL_BATCH_SIZE = 64
+LEARNING_RATE = 1e-5                    # RoBERTa-large standard; 2e-5 often unstable
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 NUM_EPOCHS = 10

@@ -36,8 +36,8 @@ def load_class_weights(device: torch.device) -> torch.Tensor | None:
 def evaluate(model, loader, device, class_w):
     model.eval()
     total, correct, loss_sum = 0, 0, 0.0
-    per_class_correct = torch.zeros(C.NUM_LABELS)
-    per_class_total = torch.zeros(C.NUM_LABELS)
+    n = C.NUM_LABELS
+    cm = torch.zeros(n, n, dtype=torch.long)
     autocast_dtype = torch.bfloat16 if C.USE_BF16 else torch.float32
     with torch.no_grad():
         for batch in loader:
@@ -53,14 +53,26 @@ def evaluate(model, loader, device, class_w):
             preds = logits_fp32.argmax(-1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-            for c in range(C.NUM_LABELS):
-                m = labels == c
-                per_class_total[c] += m.sum().item()
-                per_class_correct[c] += ((preds == c) & m).sum().item()
+            for t, p in zip(labels.tolist(), preds.tolist()):
+                cm[t, p] += 1
+
+    per_class_acc, f1s = [], []
+    for c in range(n):
+        tp = int(cm[c, c])
+        fp = int(cm[:, c].sum()) - tp
+        fn = int(cm[c, :].sum()) - tp
+        support = tp + fn
+        per_class_acc.append(tp / support if support else 0.0)
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1s.append(2 * prec * rec / (prec + rec) if (prec + rec) else 0.0)
+    macro_f1 = sum(f1s) / n
     return (
         loss_sum / max(total, 1),
         correct / max(total, 1),
-        (per_class_correct / per_class_total.clamp(min=1)).tolist(),
+        per_class_acc,
+        macro_f1,
+        f1s,
     )
 
 
@@ -121,7 +133,7 @@ def main() -> None:
     autocast_dtype = torch.bfloat16 if C.USE_BF16 else torch.float32
     use_autocast = C.USE_BF16 and device.type == "cuda"
 
-    best_acc = -1.0
+    best_f1 = -1.0
     best_path = C.MODEL_DIR / "best"
     C.MODEL_DIR.mkdir(parents=True, exist_ok=True)
     C.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,24 +175,29 @@ def main() -> None:
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
         epoch_secs = time.time() - t0
-        val_loss, val_acc, per_class = evaluate(model, val_loader, device, class_w)
+        val_loss, val_acc, per_class, val_macro_f1, val_f1s = evaluate(
+            model, val_loader, device, class_w
+        )
         print(f"[epoch {epoch}] {epoch_secs:.1f}s "
               f"train_loss={run_loss / max(seen, 1):.4f} "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
+              f"val_macro_f1={val_macro_f1:.4f}")
         for cid, name in C.ID2LABEL.items():
-            print(f"  {name:18s} acc={per_class[cid]:.3f}")
+            print(f"  {name:18s} acc={per_class[cid]:.3f}  f1={val_f1s[cid]:.3f}")
 
         metrics_log.append({
             "epoch": epoch,
             "train_loss": run_loss / max(seen, 1),
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "val_macro_f1": val_macro_f1,
             "per_class_acc": per_class,
+            "per_class_f1": val_f1s,
             "epoch_secs": epoch_secs,
         })
 
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_macro_f1 > best_f1:
+            best_f1 = val_macro_f1
             model.save_pretrained(best_path)
             tokenizer.save_pretrained(best_path)
             (best_path / "training_config.json").write_text(
@@ -188,17 +205,18 @@ def main() -> None:
                     "base_model": C.BASE_MODEL,
                     "max_seq_len": C.MAX_SEQ_LEN,
                     "label2id": C.LABEL2ID,
-                    "best_val_acc": best_acc,
+                    "best_val_macro_f1": best_f1,
+                    "best_val_acc": val_acc,
                     "epoch": epoch,
                 }, indent=2),
                 encoding="utf-8",
             )
-            print(f"  saved best → {best_path}")
+            print(f"  saved best (macro_f1={best_f1:.4f}) -> {best_path}")
 
     (C.LOG_DIR / "train_metrics.json").write_text(
         json.dumps(metrics_log, indent=2), encoding="utf-8"
     )
-    print(f"\ndone. best val_acc={best_acc:.4f}  model={best_path}")
+    print(f"\ndone. best val_macro_f1={best_f1:.4f}  model={best_path}")
 
 
 if __name__ == "__main__":
